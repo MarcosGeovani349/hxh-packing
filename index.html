@@ -136,6 +136,11 @@
   .btn-print { background:#222229; border:1px solid var(--border); color:var(--text); padding:7px 14px; border-radius:8px; font-size:12px; font-weight:600; cursor:pointer; transition:all 0.2s; white-space:nowrap; }
   .btn-print:hover { border-color:var(--yellow); color:var(--yellow); }
   .btn-print.loading { opacity:0.6; cursor:wait; }
+  .sync-badge { font-size:11px; padding:5px 10px; border-radius:6px; border:1px solid var(--border); background:#222229; white-space:nowrap; }
+  .sync-badge.syncing { color:#60a5fa; border-color:#60a5fa; }
+  .sync-badge.ok      { color:var(--green); border-color:var(--green); }
+  .sync-badge.error   { color:var(--red); border-color:var(--red); }
+  .sync-badge.offline { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -161,6 +166,7 @@
     <button class="btn-print" id="btnPrint" onclick="capturarDash()" title="Copiar dashboard como imagem">
       📸 Print
     </button>
+    <span class="sync-badge offline" id="syncBadge">☁️ —</span>
   </div>
 </div>
 
@@ -204,7 +210,7 @@
       <div>
         <div class="hc-title">👥 Cadastro HC (mapeamento de nomes e turnos)</div>
         <div class="hc-status" id="hcStatus"><span class="warn">⚠️ Não carregado — nomes exibidos como login</span></div>
-        <div style="font-size:10px;color:var(--muted);margin-top:4px">Carregue uma vez — fica salvo no navegador</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:4px">Carregue uma vez — fica salvo na nuvem para todos os turnos</div>
       </div>
       <div>
         <input type="file" id="hcInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleHCInput(event)">
@@ -259,12 +265,17 @@ const HC_KEY       = 'hxh_v2_hc';
 const LOADS_KEY    = 'hxh_v2_loads';
 const MAX_RECORDS  = 250000;
 
+// ── FIREBASE CONFIG ───────────────────────────────────────────────────────────
+// Substitua pela URL do seu projeto Firebase (ex: https://meu-projeto-default-rtdb.firebaseio.com)
+const FIREBASE_URL = 'https://hxh-packing-default-rtdb.firebaseio.com';
+const FB_ROOT      = '/hxh_packing';
+
 // ── STATE ────────────────────────────────────────────────────────────────────
 let allData = [];
 let hcMap   = new Map(); // login → {nome, turno}
 let charts  = {};
 
-// ── STORAGE ──────────────────────────────────────────────────────────────────
+// ── LOCAL CACHE (fallback offline) ───────────────────────────────────────────
 function saveData(d) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); }
   catch(e) { localStorage.setItem(STORAGE_KEY, JSON.stringify(d.slice(-50000))); }
@@ -273,6 +284,114 @@ function loadData()  { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)
 function saveHC(m)   { try { localStorage.setItem(HC_KEY, JSON.stringify([...m])); } catch(e){} }
 function loadHC()    { try { return new Map(JSON.parse(localStorage.getItem(HC_KEY) || '[]')); } catch(e) { return new Map(); } }
 function loadLoads() { try { return JSON.parse(localStorage.getItem(LOADS_KEY) || '[]'); } catch(e) { return []; } }
+
+// ── FIREBASE HELPERS ─────────────────────────────────────────────────────────
+function fbReady() { return FIREBASE_URL && !FIREBASE_URL.includes('COLE_SUA_URL'); }
+
+async function fbGet(path) {
+  const r = await fetch(`${FIREBASE_URL}${path}.json`);
+  if (!r.ok) throw new Error('Firebase GET ' + r.status);
+  return r.json();
+}
+async function fbPut(path, value) {
+  const r = await fetch(`${FIREBASE_URL}${path}.json`, {
+    method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(value)
+  });
+  if (!r.ok) throw new Error('Firebase PUT ' + r.status);
+  return r.json();
+}
+async function fbPatch(path, value) {
+  const r = await fetch(`${FIREBASE_URL}${path}.json`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(value)
+  });
+  if (!r.ok) throw new Error('Firebase PATCH ' + r.status);
+  return r.json();
+}
+
+function setSyncStatus(state, msg) {
+  const el = document.getElementById('syncBadge');
+  if (!el) return;
+  el.className = 'sync-badge ' + state;
+  const icons = { syncing:'🔄', ok:'✅', error:'⚠️', offline:'☁️' };
+  el.textContent = (icons[state]||'') + ' ' + (msg || { syncing:'Sincronizando', ok:'Nuvem OK', error:'Erro nuvem', offline:'Local' }[state] || state);
+}
+
+// Converte "DD/MM/YYYY" → "YYYYMMDD" para usar como chave Firebase
+function dateToKey(d) {
+  if (!d) return 'sem_data';
+  const [dd, mm, yyyy] = d.split('/');
+  return `${yyyy||'0000'}${mm||'00'}${dd||'00'}`;
+}
+
+async function syncFromCloud() {
+  if (!fbReady()) { setSyncStatus('offline', 'Sem config'); return; }
+  setSyncStatus('syncing');
+  try {
+    const [cloudData, cloudHC, cloudLoads] = await Promise.all([
+      fbGet(`${FB_ROOT}/data`),
+      fbGet(`${FB_ROOT}/hc`),
+      fbGet(`${FB_ROOT}/loads`)
+    ]);
+
+    // Flatten all date buckets into one array
+    const cloudRecords = [];
+    if (cloudData && typeof cloudData === 'object') {
+      for (const bucket of Object.values(cloudData)) {
+        if (Array.isArray(bucket)) cloudRecords.push(...bucket);
+      }
+    }
+
+    // Merge cloud + any local-only records (dedup by ordem)
+    const cloudOrdens = new Set(cloudRecords.filter(r => r.ordem).map(r => r.ordem));
+    const localOnly   = loadData().filter(r => !r.ordem || !cloudOrdens.has(r.ordem));
+    allData = [...cloudRecords, ...localOnly];
+    saveData(allData);
+
+    // Push local-only records to cloud if any
+    if (localOnly.length > 0) {
+      await pushRecordsToCloud(localOnly);
+    }
+
+    // Sync HC
+    if (cloudHC && Array.isArray(cloudHC)) {
+      hcMap = new Map(cloudHC);
+      saveHC(hcMap);
+      if (hcMap.size) {
+        document.getElementById('hcStatus').innerHTML = `<span class="ok">✅ ${hcMap.size} funcionários (nuvem)</span>`;
+      }
+    }
+
+    // Sync loads history
+    if (cloudLoads && Array.isArray(cloudLoads)) {
+      localStorage.setItem(LOADS_KEY, JSON.stringify(cloudLoads));
+    }
+
+    updateDateFilter();
+    renderAll();
+    setSyncStatus('ok');
+  } catch(e) {
+    setSyncStatus('error', 'Usando local');
+    showToast('Aviso: cloud indisponível — usando dados locais', 'warn');
+  }
+}
+
+async function pushRecordsToCloud(records) {
+  if (!fbReady()) return;
+  // Group by date key
+  const byDate = {};
+  for (const r of records) {
+    const k = dateToKey(r.data);
+    if (!byDate[k]) byDate[k] = [];
+    byDate[k].push(r);
+  }
+  for (const [dateKey, newRecs] of Object.entries(byDate)) {
+    let existing = [];
+    try { const c = await fbGet(`${FB_ROOT}/data/${dateKey}`); if (Array.isArray(c)) existing = c; } catch(e) {}
+    const existOrdens = new Set(existing.filter(r=>r.ordem).map(r=>r.ordem));
+    const toAdd = newRecs.filter(r => !r.ordem || !existOrdens.has(r.ordem));
+    if (toAdd.length > 0) await fbPut(`${FB_ROOT}/data/${dateKey}`, [...existing, ...toAdd]);
+  }
+}
 
 // ── HC UPLOAD ────────────────────────────────────────────────────────────────
 function handleHCInput(e) {
@@ -297,6 +416,10 @@ function handleHCInput(e) {
       // Re-apply names to existing data
       applyHCToData();
       showToast(`✅ HC carregado: ${map.size} funcionários`, 'success');
+      // Save HC to cloud
+      if (fbReady()) {
+        fbPut(`${FB_ROOT}/hc`, [...map]).catch(() => {});
+      }
     } catch(err) {
       showToast('Erro ao ler HC: ' + err.message, 'error');
     }
@@ -524,7 +647,7 @@ function parseProcessed(rows, keys) {
 }
 
 // ── MERGE (de-duplicate by ordem) ────────────────────────────────────────────
-function mergeIntoHistory(newRows, fileName) {
+async function mergeIntoHistory(newRows, fileName) {
   const existing    = loadData();
   const existingSet = new Set(existing.filter(r => r.ordem).map(r => r.ordem));
   const toAdd       = newRows.filter(r => !r.ordem || !existingSet.has(r.ordem));
@@ -540,6 +663,20 @@ function mergeIntoHistory(newRows, fileName) {
 
   updateDateFilter();
   renderAll();
+
+  // Sync to cloud
+  if (fbReady()) {
+    setSyncStatus('syncing');
+    try {
+      await pushRecordsToCloud(toAdd);
+      await fbPut(`${FB_ROOT}/loads`, loads.slice(-100));
+      setSyncStatus('ok');
+      showToast(`✅ +${toAdd.length} registros salvos na nuvem`, 'success');
+    } catch(e) {
+      setSyncStatus('error', 'Salvo local');
+      showToast(`⚠️ Salvo localmente — falhou na nuvem: ${e.message}`, 'warn');
+    }
+  }
 }
 
 // ── FILTERS ──────────────────────────────────────────────────────────────────
@@ -825,13 +962,19 @@ function renderHistory() {
   }).join('');
 }
 
-function clearHistory() {
+async function clearHistory() {
   if (!confirm('Limpar todo o histórico? Esta ação não pode ser desfeita.')) return;
   localStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem(LOADS_KEY);
   allData = [];
   updateDateFilter();
   renderAll();
+  if (fbReady()) {
+    try {
+      await fbPut(`${FB_ROOT}/data`, null);
+      await fbPut(`${FB_ROOT}/loads`, null);
+    } catch(e) {}
+  }
   showToast('Histórico limpo', 'success');
 }
 
@@ -906,7 +1049,8 @@ async function capturarDash() {
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────────────
-function init() {
+async function init() {
+  // Load local cache first (instant render)
   allData = loadData();
   hcMap   = loadHC();
 
@@ -916,6 +1060,9 @@ function init() {
 
   updateDateFilter();
   renderAll();
+
+  // Then sync from cloud (updates data if others uploaded)
+  await syncFromCloud();
 }
 
 init();
