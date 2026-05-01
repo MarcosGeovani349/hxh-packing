@@ -789,9 +789,18 @@ function renderHxH(data, tipos, theadId, tbodyId, metaHora, metaTotal, highlight
     byPerson[r.nome][r.hora] = (byPerson[r.nome][r.hora] || 0) + 1;
   }
 
+  // Detecta última hora incompleta (< 30% do volume médio das horas anteriores)
+  const hourTotals = hours.map(h => rows.filter(r => r.hora === h).length);
+  const prevTotals = hourTotals.slice(0, -1);
+  const avgPrev    = prevTotals.length ? prevTotals.reduce((s,v)=>s+v,0) / prevTotals.length : 0;
+  const lastTotal  = hourTotals[hourTotals.length - 1] || 0;
+  const partialHour = hours.length > 1 && avgPrev > 0 && lastTotal < avgPrev * 0.30
+    ? hours[hours.length - 1] : null;
+  const closedHours = partialHour ? hours.slice(0, -1) : hours;
+
   const persons = Object.entries(byPerson).sort((a,b) => {
-    const ta = hours.reduce((s,h) => s+(a[1][h]||0), 0);
-    const tb = hours.reduce((s,h) => s+(b[1][h]||0), 0);
+    const ta = closedHours.reduce((s,h) => s+(a[1][h]||0), 0);
+    const tb = closedHours.reduce((s,h) => s+(b[1][h]||0), 0);
     return tb - ta;
   });
 
@@ -801,25 +810,29 @@ function renderHxH(data, tipos, theadId, tbodyId, metaHora, metaTotal, highlight
     return `<span class="turno-chip ${cls}">${t}</span>`;
   };
 
-  const colorCell = (v, meta) => {
+  const colorCell = (v, meta, partial) => {
     if (!v) return `<span class="dash">-</span>`;
+    if (partial) return `<span style="color:var(--muted);font-style:italic">${v}</span>`;
     return meta && v >= meta ? `<span class="c-hi">${v}</span>` : `${v}`;
   };
 
-  thead.innerHTML = `<th>NOME</th>${hours.map(h=>`<th>${h}h</th>`).join('')}<th>TOTAL</th><th>MÉDIA/H</th>`;
+  thead.innerHTML = `<th>NOME</th>${hours.map(h => {
+    const isP = h === partialHour;
+    return `<th${isP ? ' title="Hora em andamento — não entra no total/média" style="color:var(--muted)"' : ''}>${h}h${isP ? ' ⏳' : ''}</th>`;
+  }).join('')}<th>TOTAL</th><th>MÉDIA/H</th>`;
 
   tbody.innerHTML = persons.map(([nome, vals]) => {
-    const horasTrabalhadas = hours.filter(h => (vals[h]||0) > 0).length;
-    const total  = hours.reduce((s,h) => s+(vals[h]||0), 0);
+    const horasTrabalhadas = closedHours.filter(h => (vals[h]||0) > 0).length;
+    const total  = closedHours.reduce((s,h) => s+(vals[h]||0), 0);
     const media  = horasTrabalhadas > 0 ? Math.round(total / horasTrabalhadas) : 0;
 
-    const cells  = hours.map(h => {
+    const cells = hours.map(h => {
       const v = vals[h] || 0;
-      return `<td>${colorCell(v, metaHora)}</td>`;
+      return `<td>${colorCell(v, metaHora, h === partialHour)}</td>`;
     }).join('');
 
-    const totalCls  = metaTotal && total >= metaTotal ? ' class="total-col c-hi-td"' : ' class="total-col"';
-    const mediaCls  = metaHora  && media >= metaHora  ? ' class="total-col c-hi-td"' : ' class="total-col"';
+    const totalCls = metaTotal && total >= metaTotal ? ' class="total-col c-hi-td"' : ' class="total-col"';
+    const mediaCls = metaHora  && media >= metaHora  ? ' class="total-col c-hi-td"' : ' class="total-col"';
 
     const rowCls = highlightNames && highlightNames.has(nome) ? ' class="row-both"' : '';
     return `<tr${rowCls}>
